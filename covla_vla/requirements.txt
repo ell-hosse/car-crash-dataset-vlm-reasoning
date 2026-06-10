@@ -1,0 +1,8 @@
+torch>=2.3
+torchvision
+transformers>=4.49
+opencv-python
+numpy
+accelerate
+# SmolVLM2 needs a recent transformers; if loading fails:
+# pip install git+https://github.com/huggingface/transformers
