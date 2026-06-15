@@ -42,10 +42,34 @@ from .preprocess import load_per_frame_jsonl, split_of
 CAM = dict(fx=2648.0, fy=2648.0, cx=964.0, cy=604.0, w=1928, h=1208, height=1.22)
 
 
+def _remap_state_keys(state: dict, model) -> dict:
+    """Handle transformers version differences in CLIPTextModel key naming
+    (checkpoint may have 'text.encoder...' vs model's 'text.text_model.encoder...'
+    or vice versa)."""
+    model_keys = set(model.state_dict().keys())
+    fixed = {}
+    for k, v in state.items():
+        if k not in model_keys and k.startswith("text."):
+            cand = ("text.text_model." + k[len("text."):]
+                    if not k.startswith("text.text_model.")
+                    else "text." + k[len("text.text_model."):])
+            if cand in model_keys:
+                fixed[cand] = v
+                continue
+        fixed[k] = v
+    return fixed
+
+
 def load_model(ckpt_path: str, device: torch.device):
     ck = torch.load(ckpt_path, map_location=device, weights_only=False)
     model, tokenizer = build_model_and_tokenizer()
-    model.load_state_dict(ck["model"])
+    state = _remap_state_keys(ck["model"], model)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    # non-persistent buffers (e.g. position_ids) may differ across versions
+    problems = [k for k in missing + unexpected if "position_ids" not in k]
+    if problems:
+        raise RuntimeError(f"checkpoint/model key mismatch: {problems[:10]}"
+                           f"{' ...' if len(problems) > 10 else ''}")
     model.to(device).eval()
     print(f"loaded {ckpt_path} (epoch {ck.get('epoch')}, "
           f"best val ADE {ck.get('best_ade', float('nan')):.3f} m)")

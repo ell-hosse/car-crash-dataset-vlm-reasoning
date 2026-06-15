@@ -12,7 +12,7 @@ Architecture (CoVLA-Agent style, sized for real-time edge inference):
 """
 import torch
 import torch.nn as nn
-from transformers import AutoModel, CLIPTextModel, CLIPTokenizerFast
+from transformers import AutoConfig, AutoModel, CLIPTextModel, CLIPTokenizerFast
 
 from .config import DATA, MODEL
 
@@ -32,7 +32,11 @@ class CoVLATrajectoryModel(nn.Module):
         self.v_proj = nn.Linear(v_dim, d)
 
         # --- language (frozen) ---
-        self.text = CLIPTextModel.from_pretrained(mcfg.text_model)
+        # newer transformers versions don't auto-extract the text config from
+        # a full CLIP checkpoint, so pass it explicitly (backward-compatible)
+        _cfg = AutoConfig.from_pretrained(mcfg.text_model)
+        _text_cfg = getattr(_cfg, "text_config", _cfg)
+        self.text = CLIPTextModel.from_pretrained(mcfg.text_model, config=_text_cfg)
         t_dim = self.text.config.hidden_size
         if mcfg.freeze_text:
             self.text.requires_grad_(False)
