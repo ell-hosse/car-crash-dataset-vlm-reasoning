@@ -11,16 +11,25 @@ import platform
 #   PATH_REMAP = {"D:\\hf": "/data/hf"}
 # Leave it empty on the Windows machine.
 # ---------------------------------------------------------------------------
+_REPO_ROOT = Path(__file__).resolve().parents[1]
+_WINDOWS_ROOT = Path("D:/hf")
+
+# Auto-detect: if the Windows data root is absent, remap to the repo-local copy.
+if not _WINDOWS_ROOT.exists():
+    PATH_REMAP: dict = {"D:/hf": str(_REPO_ROOT), "D:\\\\hf": str(_REPO_ROOT)}
+else:
+    PATH_REMAP: dict = {}
+
 DATA_ROOT = Path("D:/hf")
 METADATA_ROOT = DATA_ROOT / "CoVLA-metadata"
 MANIFEST_PATH = METADATA_ROOT / "manifest.jsonl"
 
-PATH_REMAP: dict = {
-    # "D:\\hf": "/data/hf",
-}
-
 # Where preprocessed (downsampled) frames + index are written.
-PREPROCESSED_ROOT = DATA_ROOT / "covla_preprocessed"
+# On Linux without D:/hf, fall back to the repo-local covla_preprocessed/.
+if _WINDOWS_ROOT.exists():
+    PREPROCESSED_ROOT = DATA_ROOT / "covla_preprocessed"
+else:
+    PREPROCESSED_ROOT = _REPO_ROOT / "covla_preprocessed"
 
 # Where checkpoints / exports are saved.
 OUTPUT_DIR = Path(__file__).resolve().parent / "runs"
