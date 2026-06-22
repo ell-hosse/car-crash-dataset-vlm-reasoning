@@ -273,7 +273,8 @@ def build_vlm_rag_prompt(base_prompt: str, hits: list[dict],
         "Retrieved driving-safety knowledge from visually similar scenes "
         "(use ONLY if it matches what you actually see in this frame; ignore "
         "anything that does not apply):\n"
-        f"{lines}")
+        f"{lines}\n"
+        )
 
 
 def augment_caption(base_caption: str, hits: list[dict],
