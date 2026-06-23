@@ -1,25 +1,29 @@
-"""Visualize VLA performance WITH vs WITHOUT RAG on the GTA_Crash_Dataset (video).
+"""Visualize VLA performance with SIX RAG strategies on GTA_Crash_Dataset (video).
 
-Per clip this renders an MP4 that steps through *every* frame of the original
-clip (~20 frames). Each frame shows:
-  * the camera image with three trajectories overlaid:
-      - GT          (red)    real future ego path in the ego-local BEV frame
-      - no-RAG      (green)  VLA conditioned on a PLAIN caption
-      - with-RAG    (magenta) VLA conditioned on a RAG caption whose embedding is
-                    fused with the closest retrieved crash policy
-  * a BEV plot of the same three trajectories with ADE/FDE
-  * the two captions for that frame (plain vs RAG) and the retrieved policies.
+Per clip this renders an MP4 stepping through every frame. Each frame shows:
+  * the camera image with trajectories overlaid:
+      - GT             (red)       real future ego path in the ego-local BEV frame
+      - no-RAG         (yellow)    VLA conditioned on a plain caption
+      - policy-prompt  (green)     VLA conditioned on a policy-injected caption
+      - Fix3-adaptive  (purple)    plain caption + softmax-weighted top-k policy
+                                   embedding blend → VLA
+      - Fix4-uniform   (gold)      plain caption + uniform top-k avg + L2-norm
+                                   embedding blend → VLA
+      - Fix3-hybrid    (cyan)      policy-prompt caption + Fix3 embedding blend
+      - Fix4-hybrid    (orange)    policy-prompt caption + Fix4 embedding blend
+  * a BEV plot of the same trajectories with ADE metrics
+  * both captions (plain and policy-conditioned) and retrieved policy text
 
-RAG is applied in TWO places, both keyed on the CLIP-retrieved crash policies:
-  1. Captioning: the CLOSEST policy (top-1) fills the {trigger}/{latent_risk}/
-     {mitigation} slots of RAG_CAPTION_PROMPT, so the captioner writes a
-     risk-aware, action-first caption.
-  2. Embedding: that RAG caption is encoded and score-gated-fused with the
-     closest policy embedding, following test_gta_crash_dataset.py's adaptive
-     fix reduced to the single closest policy:
-         fused = (1 - s)*caption_emb + s*policy_emb,   s = top-1 similarity score
-     (policy text = "latent_risk. mitigation"). The fused embedding conditions
-     the with-RAG prediction.
+Six RAG strategies:
+  1. no-RAG         plain caption tokenised → VLA
+  2. policy-prompt  top-1 policy fills {trigger}/{latent_risk}/{mitigation} in the
+                    RAG_CAPTION_PROMPT; that caption is tokenised → VLA
+  3. Fix3-adaptive  plain caption embedding score-gated-fused with softmax-weighted
+                    top-k policy embeddings
+  4. Fix4-uniform   plain caption embedding blended with uniform-mean top-k policy
+                    embeddings then L2-normalised
+  5. Fix3-hybrid    same as Fix3 but uses the policy-prompt caption as the text base
+  6. Fix4-hybrid    same as Fix4 but uses the policy-prompt caption as the text base
 
 The captioner is selectable with --captioner:
      smolvlm2   -> HuggingFaceTB/SmolVLM2-256M-Video-Instruct  (tiny, fast)
@@ -32,8 +36,12 @@ projected into the ego frame. Near the end of a clip fewer future frames exist,
 so the GT horizon simply shrinks (and the very last frame, with no future, has
 no GT); predictions and captions are still drawn for those frames.
 
+Frames are horizontally flipped before being passed to the VLA to match the
+CoVLA training distribution (left-hand traffic). The lateral component of all
+predicted waypoints is negated afterwards to restore GTA's coordinate frame.
+
 Usage (from repo root):
-    python -m testing_final_performance.visualize_vla_performance_on_gtaCrash_with_rag \
+    python -m testing_final_performance.visualize_vla_performance_on_gtaCrash_with_rag \\
         --num-clips 5 [--captioner qwen2.5-vl] [--policy-source crash|abstract] [--seed 0]
 """
 from __future__ import annotations
@@ -65,7 +73,7 @@ CAPTIONER_IDS = {
     "qwen2-vl":   "Qwen/Qwen2-VL-2B-Instruct",       # smallest free Qwen2-VL
 }
 
-# RAG captioner prompt: the CLOSEST retrieved crash policy is injected into the
+# RAG captioner prompt: the top-1 retrieved crash policy is injected into the
 # {trigger}/{latent_risk}/{mitigation} slots so the captioner writes a
 # risk-aware, action-first caption.
 RAG_CAPTION_PROMPT = (
@@ -93,7 +101,7 @@ RAG_CAPTION_PROMPT = (
 
 
 def build_custom_rag_prompt(hits, base_prompt):
-    """Fill RAG_CAPTION_PROMPT with the CLOSEST retrieved policy (top-1 hit).
+    """Fill RAG_CAPTION_PROMPT with the closest retrieved policy (top-1 hit).
 
     Falls back to the plain base prompt when nothing is retrieved.
     """
@@ -106,15 +114,6 @@ def build_custom_rag_prompt(hits, base_prompt):
             .replace("{mitigation}",  str(h.get("mitigation", "")).strip()))
 
 
-def closest_policy_text(hits):
-    """'latent_risk. mitigation' for the closest policy (top-1), or None."""
-    if not hits:
-        return None
-    h = hits[0]
-    txt = f"{h.get('latent_risk','')}. {h.get('mitigation','')}".strip(". ")
-    return txt or None
-
-
 GTA_PARTITION_NAMES = [
     "GTACrash_accident_part1",
     "GTACrash_accident_part2",
@@ -123,12 +122,25 @@ GTA_PARTITION_NAMES = [
     "GTACrash_nonaccident_part2",
 ]
 
-# BGR for OpenCV overlay
-COL_GT   = (0,   0,   255)   # red
-COL_NORAG = (0,  255, 0)     # green
-COL_RAG  = (255, 0,   255)   # magenta
+# BGR colours for OpenCV overlays
+COL_GT      = (0,   0,   255)   # red
+COL_NORAG   = (0,   255, 255)   # yellow
+COL_PROMPT  = (0,   200, 0  )   # green
+COL_FIX3    = (128, 0,   128)   # purple
+COL_FIX4    = (0,   215, 255)   # gold
+COL_FIX3H   = (255, 200, 0  )   # cyan
+COL_FIX4H   = (0,   128, 255)   # orange
 
-MPL_COLS = {"GT": "red", "no-RAG": "green", "with-RAG": "magenta"}
+# Matplotlib colours
+MPL_COLS = {
+    "GT":            "red",
+    "no-RAG":        "gold",
+    "policy-prompt": "green",
+    "Fix3-adaptive": "purple",
+    "Fix4-uniform":  "darkorange",
+    "Fix3-hybrid":   "cyan",
+    "Fix4-hybrid":   "orange",
+}
 
 
 # ===========================================================================
@@ -335,7 +347,67 @@ def hits_to_policy_text(hits):
 
 
 # ===========================================================================
-#  Inference (no-RAG caption vs with-RAG fused embedding) + metrics
+#  Embedding helpers: Fix3 (softmax-weighted) and Fix4 (uniform + L2)
+# ===========================================================================
+
+def _enc(model, tokenizer, text, device):
+    """Pooled caption/policy embedding -> (1, 1, d)."""
+    tok = tokenizer([text], padding=True, truncation=True,
+                    max_length=77, return_tensors="pt").to(device)
+    return model.encode_text(tok["input_ids"], tok["attention_mask"])
+
+
+def _softmax_weights(scores: np.ndarray, temperature: float = 0.1) -> np.ndarray:
+    score_range = scores.max() - scores.min()
+    normed = (scores - scores.min()) / (score_range + 1e-8)
+    exp_s  = np.exp(normed / temperature)
+    return exp_s / exp_s.sum()
+
+
+def _fix3_embed(model, tokenizer, caption, hits, device, temperature=0.1):
+    """Score-adaptive softmax-weighted top-k policy embedding fusion.
+
+    fused = (1 - gate) * cap_e + gate * softmax_weighted_pol_pool
+    where gate = max retrieval score.
+    """
+    cap_e = _enc(model, tokenizer, caption, device)
+    if not hits:
+        return cap_e
+    scores  = np.array([h["score"] for h in hits], dtype=np.float32)
+    weights = _softmax_weights(scores, temperature)
+    pol_embs = torch.cat([
+        _enc(model, tokenizer,
+             f"{h.get('latent_risk','')}. {h.get('mitigation','')}".strip(". "),
+             device) for h in hits], dim=0)
+    w_t      = torch.tensor(weights, dtype=pol_embs.dtype,
+                            device=device).view(-1, 1, 1)
+    pol_pool = (w_t * pol_embs).sum(dim=0, keepdim=True)
+    gate     = float(scores.max())
+    return (1.0 - gate) * cap_e + gate * pol_pool
+
+
+def _fix4_embed(model, tokenizer, caption, hits, device):
+    """Uniform-mean top-k policy embedding blend, L2-normalised.
+
+    blended = (1 - w) * cap_e + w * mean(pol_embs),  then L2-normed
+    where w = max retrieval score.
+    """
+    cap_e = _enc(model, tokenizer, caption, device)
+    if not hits:
+        return cap_e
+    scores   = np.array([h["score"] for h in hits], dtype=np.float32)
+    w        = float(scores.max())
+    pol_embs = torch.cat([
+        _enc(model, tokenizer,
+             f"{h.get('latent_risk','')}. {h.get('mitigation','')}".strip(". "),
+             device) for h in hits], dim=0)
+    pol_mean = pol_embs.mean(dim=0, keepdim=True)
+    blended  = (1.0 - w) * cap_e + w * pol_mean
+    return blended / (blended.norm(dim=-1, keepdim=True) + 1e-12)
+
+
+# ===========================================================================
+#  VLA inference + metrics
 # ===========================================================================
 
 def ade_fde(pred: np.ndarray, gt: np.ndarray) -> tuple[float, float]:
@@ -346,104 +418,77 @@ def ade_fde(pred: np.ndarray, gt: np.ndarray) -> tuple[float, float]:
 
 
 @torch.no_grad()
-def predict_caption_variant(model, tokenizer, samples, captions, device,
-                            batch_size=32, num_waypoints=None) -> np.ndarray:
-    """No-RAG baseline: VLA conditioned on a plain caption (tokenized). (N,T,2) m."""
-    preds = []
-    for i in range(0, len(samples), batch_size):
-        chunk = samples[i:i + batch_size]
-        caps  = list(captions[i:i + batch_size])
-        imgs  = torch.stack([preprocess_image(
-            cv2.imread(str(s["image_path"]))) for s in chunk]).to(device)
-        states = torch.stack([state_to_vec(s["state"]) for s in chunk]).to(device)
-        tok = tokenizer(caps, padding=True, truncation=True,
-                        max_length=77, return_tensors="pt").to(device)
-        pred = model(imgs, states, tok["input_ids"], tok["attention_mask"])
-        preds.append(pred.float().cpu().numpy())
-    out = denormalize_traj(np.concatenate(preds, axis=0))
-    if num_waypoints is not None:
-        out = out[:, :num_waypoints, :]
-    return out
-
-
-def _enc(model, tokenizer, text, device):
-    """Pooled caption/policy embedding -> (1, 1, d)."""
-    tok = tokenizer([text], padding=True, truncation=True,
+def predict_traj(model, tokenizer, device, bgr_vla: np.ndarray,
+                 state_vec, caption: str, num_waypoints: int) -> np.ndarray:
+    """Tokenised-caption path (no-RAG or policy-prompt). Returns (T, 2) m."""
+    img = preprocess_image(bgr_vla).unsqueeze(0).to(device)
+    st  = state_vec.unsqueeze(0).to(device)
+    tok = tokenizer([caption], padding=True, truncation=True,
                     max_length=77, return_tensors="pt").to(device)
-    return model.encode_text(tok["input_ids"], tok["attention_mask"])
-
-
-def make_rag_fused_embed(model, tokenizer, rag_caps, hits_batch, device):
-    """Score-gated fusion of the RAG-caption embedding with the closest policy.
-
-    Mirrors test_gta_crash_dataset.py's adaptive fix, reduced to the single
-    closest (top-1) policy:  fused = (1 - s)*cap_e + s*pol_e,  where s is the
-    top-1 retrieval similarity score (gate in [0, 1]). When nothing is
-    retrieved the plain RAG-caption embedding is used. Returns (B, 1, d).
-    """
-    results = []
-    for cap, hits in zip(rag_caps, hits_batch):
-        cap_e = _enc(model, tokenizer, cap, device)
-        ptxt  = closest_policy_text(hits)
-        if ptxt is None:
-            results.append(cap_e)
-            continue
-        pol_e = _enc(model, tokenizer, ptxt, device)
-        gate  = float(np.clip(hits[0]["score"], 0.0, 1.0))   # top-1 score gate
-        results.append((1.0 - gate) * cap_e + gate * pol_e)
-    return torch.cat(results, dim=0)
+    pred = model(img, st, input_ids=tok["input_ids"],
+                 attention_mask=tok["attention_mask"])
+    out = denormalize_traj(pred[0].float().cpu().numpy())
+    return out[:num_waypoints]
 
 
 @torch.no_grad()
-def predict_rag_fused(model, tokenizer, samples, rag_caps, hits_list, device,
-                      batch_size=32, num_waypoints=None) -> np.ndarray:
-    """With-RAG prediction: VLA conditioned on the fused (RAG caption +
-    closest policy) text embedding. (N, T, 2) metres."""
-    preds = []
-    for i in range(0, len(samples), batch_size):
-        chunk = samples[i:i + batch_size]
-        caps  = list(rag_caps[i:i + batch_size])
-        hits  = hits_list[i:i + batch_size]
-        imgs  = torch.stack([preprocess_image(
-            cv2.imread(str(s["image_path"]))) for s in chunk]).to(device)
-        states = torch.stack([state_to_vec(s["state"]) for s in chunk]).to(device)
-        fused = make_rag_fused_embed(model, tokenizer, caps, hits, device)
-        pred  = model(imgs, states, text_embed=fused)
-        preds.append(pred.float().cpu().numpy())
-    out = denormalize_traj(np.concatenate(preds, axis=0))
-    if num_waypoints is not None:
-        out = out[:, :num_waypoints, :]
-    return out
+def predict_traj_embed(model, device, bgr_vla: np.ndarray,
+                       state_vec, text_embed, num_waypoints: int) -> np.ndarray:
+    """Pre-computed embedding path (Fix3, Fix4). Returns (T, 2) m."""
+    img = preprocess_image(bgr_vla).unsqueeze(0).to(device)
+    st  = state_vec.unsqueeze(0).to(device)
+    pred = model(img, st, text_embed=text_embed)
+    out = denormalize_traj(pred[0].float().cpu().numpy())
+    return out[:num_waypoints]
 
 
 # ===========================================================================
 #  Visualisation
 # ===========================================================================
 
-def draw_overlay(sample, gt, p_no, p_rag):
-    bgr = cv2.imread(str(sample["image_path"]))
-    layers = [(p_no, COL_NORAG), (p_rag, COL_RAG)]
+def draw_overlay(bgr_orig, gt, p_norag, p_prompt, p_f3, p_f4, p_f3h, p_f4h):
+    """Camera frame (original, unflipped) with all trajectory overlays."""
+    out = bgr_orig.copy()
+    layers = [
+        (p_norag,  COL_NORAG),
+        (p_prompt, COL_PROMPT),
+        (p_f3,     COL_FIX3),
+        (p_f4,     COL_FIX4),
+        (p_f3h,    COL_FIX3H),
+        (p_f4h,    COL_FIX4H),
+    ]
     if gt is not None:
         layers = [(gt, COL_GT)] + layers
     for traj, col in layers:
-        pts = project_traj(traj, bgr.shape)
+        if traj is None:
+            continue
+        pts = project_traj(traj, out.shape)
         if len(pts) >= 2:
-            cv2.polylines(bgr, [pts], False, col, 2)
+            cv2.polylines(out, [pts], False, col, 2)
         for p in pts:
-            cv2.circle(bgr, tuple(p), 3, col, -1)
-    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            cv2.circle(out, tuple(p), 3, col, -1)
+    return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
 
-def plot_bev(ax, gt, p_no, p_rag, title=""):
-    series = [(p_no, "no-RAG"), (p_rag, "with-RAG")]
+def plot_bev(ax, gt, p_norag, p_prompt, p_f3, p_f4, p_f3h, p_f4h, title=""):
+    series = [
+        (p_norag,  "no-RAG"),
+        (p_prompt, "policy-prompt"),
+        (p_f3,     "Fix3-adaptive"),
+        (p_f4,     "Fix4-uniform"),
+        (p_f3h,    "Fix3-hybrid"),
+        (p_f4h,    "Fix4-hybrid"),
+    ]
     if gt is not None:
         series = [(gt, "GT")] + series
     for arr, lbl in series:
+        if arr is None:
+            continue
         ax.plot(-arr[:, 1], arr[:, 0], "o-", color=MPL_COLS[lbl],
                 ms=3, lw=1.5, label=lbl)
     ax.scatter([0], [0], marker="^", s=70, color="black", zorder=5, label="ego")
     ax.set_xlabel("lateral (m, right +)"); ax.set_ylabel("forward (m)")
-    ax.set_title(title, fontsize=8); ax.axis("equal")
+    ax.set_title(title, fontsize=7); ax.axis("equal")
     ax.grid(alpha=0.3); ax.legend(fontsize=6)
 
 
@@ -454,54 +499,81 @@ def _wrap(label, text, width=80, max_lines=3):
     return label + ("\n" + " " * len(label)).join(lines)
 
 
-def render_clip_video(samples, p_no, p_rag, caps_plain, caps_rag,
+def render_clip_video(samples, trajs, caps_plain, caps_rag,
                       policy_texts, hits_list, policy_label, captioner_label,
                       out_path, fps=4):
-    """One MP4 covering every frame of the clip; each frame shows both
-    trajectories, both captions and the retrieved policies."""
+    """One MP4 covering every frame of the clip.
+
+    trajs is a dict with keys: no_rag, prompt, f3, f4, f3h, f4h —
+    each a list of (T,2) arrays.
+    """
     writer = None
     for k, s in enumerate(samples):
-        gt = s["gt_traj"]
+        gt       = s["gt_traj"]
+        p_norag  = trajs["no_rag"][k]
+        p_prompt = trajs["prompt"][k]
+        p_f3     = trajs["f3"][k]
+        p_f4     = trajs["f4"][k]
+        p_f3h    = trajs["f3h"][k]
+        p_f4h    = trajs["f4h"][k]
+
         if gt is not None:
-            an, fn = ade_fde(p_no[k], gt)
-            ar, fr = ade_fde(p_rag[k], gt)
-            metric_line = (f"ADE  no-RAG {an:.2f}  with-RAG {ar:.2f} m   "
-                           f"FDE  no-RAG {fn:.2f}  with-RAG {fr:.2f} m")
+            an, _  = ade_fde(p_norag,  gt)
+            ar, _  = ade_fde(p_prompt, gt)
+            a3, _  = ade_fde(p_f3,     gt)
+            a4, _  = ade_fde(p_f4,     gt)
+            a3h, _ = ade_fde(p_f3h,    gt)
+            a4h, _ = ade_fde(p_f4h,    gt)
+            metric_line = (
+                f"ADE  no-RAG {an:.2f}  prompt {ar:.2f}  "
+                f"Fix3 {a3:.2f}  Fix4 {a4:.2f}  "
+                f"Fix3h {a3h:.2f}  Fix4h {a4h:.2f} m"
+            )
         else:
             metric_line = "ADE/FDE  n/a (no future frames for GT)"
+
         top_score = hits_list[k][0]["score"] if hits_list[k] else 0.0
         crash_tag = "CRASH" if s["is_crash"] else "BENIGN"
 
-        fig = plt.figure(figsize=(15, 9))
-        gs  = fig.add_gridspec(3, 2, height_ratios=[2.8, 0.9, 0.9],
+        fig = plt.figure(figsize=(15, 10))
+        gs  = fig.add_gridspec(4, 2, height_ratios=[2.8, 0.7, 0.7, 0.7],
                                width_ratios=[1.7, 1])
         ax_img = fig.add_subplot(gs[0, 0])
         ax_bev = fig.add_subplot(gs[0, 1])
         ax_t1  = fig.add_subplot(gs[1, :])
         ax_t2  = fig.add_subplot(gs[2, :])
+        ax_t3  = fig.add_subplot(gs[3, :])
 
-        ax_img.imshow(draw_overlay(s, gt, p_no[k], p_rag[k]))
+        bgr_orig = cv2.imread(str(s["image_path"]))
+        ax_img.imshow(draw_overlay(bgr_orig, gt, p_norag, p_prompt,
+                                   p_f3, p_f4, p_f3h, p_f4h))
         ax_img.set_title(
             f"{s['clip_id']}  frame {s['frame_idx']}/{len(samples)-1}  "
             f"[{crash_tag}]  policies: {policy_label}  captioner: {captioner_label}  "
             f"top-score={top_score:.3f}\n"
-            f"GT=red   no-RAG=green   with-RAG=magenta", fontsize=8)
+            "GT=red  no-RAG=yellow  policy-prompt=green  "
+            "Fix3=purple  Fix4=gold  Fix3h=cyan  Fix4h=orange", fontsize=7.5)
         ax_img.axis("off")
 
-        plot_bev(ax_bev, gt, p_no[k], p_rag[k], metric_line)
+        plot_bev(ax_bev, gt, p_norag, p_prompt, p_f3, p_f4, p_f3h, p_f4h,
+                 metric_line)
 
         ids = ", ".join(f"{h['clip_id']}({h['score']:.2f})" for h in hits_list[k])
         ax_t1.axis("off")
         ax_t1.text(0, 1,
-            _wrap("Caption (no-RAG): ", caps_plain[k]) + "\n" +
-            _wrap("Caption (with-RAG): ", caps_rag[k]),
+            _wrap("Caption (no-RAG): ",         caps_plain[k]) + "\n" +
+            _wrap("Caption (policy-prompt): ",   caps_rag[k]),
             transform=ax_t1.transAxes, fontsize=7.5, family="monospace",
             va="top", ha="left")
         ax_t2.axis("off")
         ax_t2.text(0, 1,
-            _wrap("Retrieved policies: ", policy_texts[k]) + "\n" +
-            f"Retrieved ids:      {ids}",
+            _wrap("Retrieved policies: ", policy_texts[k]),
             transform=ax_t2.transAxes, fontsize=7.5, family="monospace",
+            va="top", ha="left")
+        ax_t3.axis("off")
+        ax_t3.text(0, 1,
+            f"Retrieved ids: {ids}",
+            transform=ax_t3.transAxes, fontsize=7.5, family="monospace",
             va="top", ha="left")
 
         fig.tight_layout()
@@ -523,7 +595,7 @@ def render_clip_video(samples, p_no, p_rag, caps_plain, caps_rag,
 
 def main():
     ap = argparse.ArgumentParser(
-        description="Render with-RAG vs no-RAG trajectory videos on GTA crash clips.")
+        description="Render four-strategy RAG trajectory videos on GTA crash clips.")
     ap.add_argument("--ckpt",             default=str(REPO_ROOT / "covla_vla_best.pt"))
     ap.add_argument("--gta-root",         default=DEFAULT_GTA_ROOT)
     ap.add_argument("--policy-source",    default="crash", choices=["crash", "abstract"])
@@ -551,6 +623,8 @@ def main():
                     help="Frames pooled by CLIP for each retrieval")
     ap.add_argument("--scan-limit",       type=int,   default=1500,
                     help="Max frames read per partition (each has ~52k); 0 = all")
+    ap.add_argument("--caption-interval", type=int,   default=1,
+                    help="Frames between caption + retrieval refreshes (1 = every frame)")
     ap.add_argument("--include-benign",   action="store_true",
                     help="Also sample nonaccident partitions (default: crash only)")
     args = ap.parse_args()
@@ -624,67 +698,127 @@ def main():
 
     for ci, (clip_id, samples) in enumerate(chosen):
         crash_tag = "CRASH" if samples[0]["is_crash"] else "BENIGN"
-        print(f"[{ci}] {clip_id} [{crash_tag}]: {len(samples)} frames "
-              f"(captioning every frame x2 with {cap_tag})")
+        print(f"[{ci}] {clip_id} [{crash_tag}]: {len(samples)} frames  "
+              f"(caption every {args.caption_interval} frame(s) x2)")
 
-        # ---- per-frame captions: plain (no-RAG) and RAG-steered (with-RAG)
+        # ---- per-frame captions and retrieval hits
         caps_plain, caps_rag, policy_texts, hits_list = [], [], [], []
+        cur_cap_plain: str | None = None
+        cur_cap_rag:   str | None = None
         t_cap: list[float] = []
+
         for j, s in enumerate(samples):
-            bgr  = cv2.imread(str(s["image_path"]))
-            hits = retr.hits_for(samples, j)
-            t0 = time.time()
-            cap_plain = vlm.caption(bgr, base_prompt)
-            cap_rag   = vlm.caption(bgr, build_custom_rag_prompt(hits, base_prompt))
-            t_cap.append(time.time() - t0)
-            caps_plain.append(cap_plain)
-            caps_rag.append(cap_rag)
+            bgr     = cv2.imread(str(s["image_path"]))
+            bgr_vla = cv2.flip(bgr, 1)          # flip to match CoVLA training distribution
+            hits    = retr.hits_for(samples, j)
+
+            if (j % args.caption_interval == 0) or (cur_cap_plain is None):
+                t0 = time.time()
+                cur_cap_plain = vlm.caption(bgr_vla, base_prompt)
+                cur_cap_rag   = vlm.caption(bgr_vla,
+                                            build_custom_rag_prompt(hits, base_prompt))
+                t_cap.append(time.time() - t0)
+
+            caps_plain.append(cur_cap_plain)
+            caps_rag.append(cur_cap_rag)
             policy_texts.append(hits_to_policy_text(hits))
             hits_list.append(hits)
+
             if (j + 1) % 10 == 0:
                 print(f"    captioned {j + 1}/{len(samples)} frames")
 
-        caps_plain_arr = np.array(caps_plain, dtype=object)
-        caps_rag_arr   = np.array(caps_rag,   dtype=object)
+        # ---- per-frame predictions — six strategies
+        trajs: dict[str, list] = {
+            "no_rag": [], "prompt": [], "f3": [], "f4": [], "f3h": [], "f4h": []
+        }
 
-        # ---- predictions
-        #  no-RAG  : plain caption -> VLA
-        #  with-RAG: RAG caption (custom prompt + closest policy) whose embedding
-        #            is score-gated-fused with the closest policy embedding -> VLA
-        p_no  = predict_caption_variant(model, tokenizer, samples, caps_plain_arr,
-                                        device, num_waypoints=num_waypoints)
-        p_rag = predict_rag_fused(model, tokenizer, samples, caps_rag_arr,
-                                  hits_list, device, num_waypoints=num_waypoints)
+        for k, s in enumerate(samples):
+            bgr     = cv2.imread(str(s["image_path"]))
+            bgr_vla = cv2.flip(bgr, 1)
+            sv      = state_to_vec(s["state"])
+            hits    = hits_list[k]
+            cap_plain = caps_plain[k]
+            cap_rag   = caps_rag[k]
+
+            with torch.no_grad():
+                p_norag  = predict_traj(model, tokenizer, device, bgr_vla, sv,
+                                        cap_plain, num_waypoints)
+                p_prompt = predict_traj(model, tokenizer, device, bgr_vla, sv,
+                                        cap_rag, num_waypoints)
+                p_f3     = predict_traj_embed(
+                    model, device, bgr_vla, sv,
+                    _fix3_embed(model, tokenizer, cap_plain, hits, device),
+                    num_waypoints)
+                p_f4     = predict_traj_embed(
+                    model, device, bgr_vla, sv,
+                    _fix4_embed(model, tokenizer, cap_plain, hits, device),
+                    num_waypoints)
+                # Hybrid: use policy-prompt caption as the text base for Fix3/Fix4
+                p_f3h    = predict_traj_embed(
+                    model, device, bgr_vla, sv,
+                    _fix3_embed(model, tokenizer, cap_rag, hits, device),
+                    num_waypoints)
+                p_f4h    = predict_traj_embed(
+                    model, device, bgr_vla, sv,
+                    _fix4_embed(model, tokenizer, cap_rag, hits, device),
+                    num_waypoints)
+
+            # Negate lateral to undo the horizontal flip (restore GTA frame)
+            for p in (p_norag, p_prompt, p_f3, p_f4, p_f3h, p_f4h):
+                p[:, 1] *= -1
+
+            trajs["no_rag"].append(p_norag)
+            trajs["prompt"].append(p_prompt)
+            trajs["f3"].append(p_f3)
+            trajs["f4"].append(p_f4)
+            trajs["f3h"].append(p_f3h)
+            trajs["f4h"].append(p_f4h)
 
         # ---- aggregate ADE over frames that have GT
-        ades_no  = [ade_fde(p_no[k], s["gt_traj"])[0]
+        def _mean_ade(preds):
+            vals = [ade_fde(preds[k], s["gt_traj"])[0]
                     for k, s in enumerate(samples) if s["gt_traj"] is not None]
-        ades_rag = [ade_fde(p_rag[k], s["gt_traj"])[0]
-                    for k, s in enumerate(samples) if s["gt_traj"] is not None]
-        mean_no  = float(np.mean(ades_no))  if ades_no  else float("nan")
-        mean_rag = float(np.mean(ades_rag)) if ades_rag else float("nan")
-        print(f"    mean ADE  no-RAG {mean_no:.3f}  |  with-RAG {mean_rag:.3f} m  "
-              f"({len(ades_no)} frames w/ GT, caption {np.mean(t_cap)*1e3:.0f} ms/frame x2)")
+            return float(np.mean(vals)) if vals else float("nan")
+
+        n_gt    = sum(1 for s in samples if s["gt_traj"] is not None)
+        cap_ms  = np.mean(t_cap) * 1e3 if t_cap else 0.0
+        print(f"    mean ADE  "
+              f"no-RAG {_mean_ade(trajs['no_rag']):.3f}  "
+              f"prompt {_mean_ade(trajs['prompt']):.3f}  "
+              f"Fix3 {_mean_ade(trajs['f3']):.3f}  "
+              f"Fix4 {_mean_ade(trajs['f4']):.3f}  "
+              f"Fix3h {_mean_ade(trajs['f3h']):.3f}  "
+              f"Fix4h {_mean_ade(trajs['f4h']):.3f} m  "
+              f"({n_gt} frames w/ GT, {cap_ms:.0f} ms/caption x2)")
 
         # ---- render the video
         out = OUT_DIR / f"gta_{ci:02d}_{clip_id}_{pol_label}_{cap_tag}.mp4"
-        render_clip_video(samples, p_no, p_rag, caps_plain, caps_rag,
-                          policy_texts, hits_list, pol_label, cap_tag, out, fps=args.fps)
+        render_clip_video(samples, trajs, caps_plain, caps_rag,
+                          policy_texts, hits_list, pol_label, cap_tag, out,
+                          fps=args.fps)
         print(f"    wrote {out.name}")
 
         all_metrics[clip_id] = [{
-            "frame_idx":   s["frame_idx"],
-            "is_crash":    s["is_crash"],
-            "has_gt":      s["gt_traj"] is not None,
-            "caption_no_rag":   caps_plain[k],
-            "caption_with_rag": caps_rag[k],
-            "policy_text":      policy_texts[k],
-            "retrieved":   [{"clip_id": h["clip_id"], "score": h["score"]}
-                            for h in hits_list[k]],
-            "ade_no_rag":  (ade_fde(p_no[k], s["gt_traj"])[0]
-                            if s["gt_traj"] is not None else None),
-            "ade_with_rag": (ade_fde(p_rag[k], s["gt_traj"])[0]
-                             if s["gt_traj"] is not None else None),
+            "frame_idx":             s["frame_idx"],
+            "is_crash":              s["is_crash"],
+            "has_gt":                s["gt_traj"] is not None,
+            "caption_no_rag":        caps_plain[k],
+            "caption_policy_prompt": caps_rag[k],
+            "policy_text":           policy_texts[k],
+            "retrieved": [{"clip_id": h["clip_id"], "score": h["score"]}
+                          for h in hits_list[k]],
+            "ade_no_rag":          (ade_fde(trajs["no_rag"][k], s["gt_traj"])[0]
+                                    if s["gt_traj"] is not None else None),
+            "ade_policy_prompt":   (ade_fde(trajs["prompt"][k], s["gt_traj"])[0]
+                                    if s["gt_traj"] is not None else None),
+            "ade_fix3_adaptive":   (ade_fde(trajs["f3"][k], s["gt_traj"])[0]
+                                    if s["gt_traj"] is not None else None),
+            "ade_fix4_uniform":    (ade_fde(trajs["f4"][k], s["gt_traj"])[0]
+                                    if s["gt_traj"] is not None else None),
+            "ade_fix3_hybrid":     (ade_fde(trajs["f3h"][k], s["gt_traj"])[0]
+                                    if s["gt_traj"] is not None else None),
+            "ade_fix4_hybrid":     (ade_fde(trajs["f4h"][k], s["gt_traj"])[0]
+                                    if s["gt_traj"] is not None else None),
         } for k, s in enumerate(samples)]
 
     metrics_path = OUT_DIR / f"metrics_gta_with_rag_{pol_label}_{cap_tag}.json"
@@ -693,10 +827,21 @@ def main():
 
     all_recs = [r for recs in all_metrics.values() for r in recs if r["has_gt"]]
     if all_recs:
+        def _agg(key):
+            vals = [r[key] for r in all_recs if r.get(key) is not None]
+            return float(np.mean(vals)) if vals else float("nan")
+
         print(f"\n=== aggregate ADE  [{pol_label} | {cap_tag}]  "
               f"(n={len(all_recs)} frames w/ GT) ===")
-        print(f"  no-RAG   : {np.mean([r['ade_no_rag']   for r in all_recs]):.3f} m")
-        print(f"  with-RAG : {np.mean([r['ade_with_rag'] for r in all_recs]):.3f} m")
+        for name, key in [
+            ("no-RAG",        "ade_no_rag"),
+            ("policy-prompt", "ade_policy_prompt"),
+            ("Fix3-adaptive", "ade_fix3_adaptive"),
+            ("Fix4-uniform",  "ade_fix4_uniform"),
+            ("Fix3-hybrid",   "ade_fix3_hybrid"),
+            ("Fix4-hybrid",   "ade_fix4_hybrid"),
+        ]:
+            print(f"  {name:<18}: {_agg(key):.3f} m")
     print(f"\nall outputs in {OUT_DIR}")
 
 
