@@ -45,7 +45,7 @@ Usage (from repo root):
         --num-clips 5 [--captioner qwen2.5-vl] [--policy-source crash|abstract] [--seed 0]
 """
 from __future__ import annotations
-import argparse, json, random, sys, textwrap, time
+import argparse, json, random, sys, textwrap, time, re
 from pathlib import Path
 
 import cv2, numpy as np, torch
@@ -60,7 +60,7 @@ from covla_vla.config import REALTIME                                         # 
 from covla_vla.dataset import preprocess_image, state_to_vec, denormalize_traj  # noqa: E402
 from covla_vla.infer_realtime import load_model, project_traj                 # noqa: E402
 from clip_retrieval import (build_or_load_policy_index, ClipEmbedder,         # noqa: E402
-                            pool_clip_video_embedding,
+                            pool_clip_video_embedding, build_vlm_rag_prompt,
                             DEFAULT_CLIP_MODEL, DEFAULT_INDEX)
 
 OUT_DIR = Path(__file__).resolve().parent / "viz_gta_with_rag"
@@ -99,6 +99,29 @@ RAG_CAPTION_PROMPT = (
     "cut off."
 )
 
+# ---------------------------------------------------------------------------
+# V2 RAG prompt: fixes the three observed failure modes
+#   (1) Qwen Chinese code-switch  -> explicit English mandate at the very start
+#   (2) SmolVLM2 verbatim copy   -> "do not copy", scene-anchor step required
+#   (3) Hazard buried past CLIP   -> single sentence, strictly <=40 words
+#   (4) Single-hit repetition     -> show all top-k, model selects the best one
+#   (5) Bold markdown trigger     -> no ** formatting anywhere in the template
+# ---------------------------------------------------------------------------
+RAG_CAPTION_PROMPT_V2 = (
+    "Respond in English only.\n"
+    "You are the perception module of a self-driving car.\n\n"
+    "Safety knowledge from visually similar crash scenes "
+    "(choose the ONE entry that best matches what you actually see; "
+    "ignore the others):\n"
+    "{policy_list}\n\n"
+    "First, look at the image and identify the most safety-critical "
+    "object or condition visible right now.\n"
+    "Then write ONE sentence, strictly under 40 words, in this order:\n"
+    "1) Name the hazard you see (not from the list unless it matches).\n"
+    "2) State what the ego vehicle is doing about it.\n"
+    "Do not copy the policy text. Use your own words based on what you see."
+)
+
 
 def build_custom_rag_prompt(hits, base_prompt):
     """Fill RAG_CAPTION_PROMPT with the closest retrieved policy (top-1 hit).
@@ -112,6 +135,248 @@ def build_custom_rag_prompt(hits, base_prompt):
             .replace("{trigger}",     str(h.get("trigger", "")).strip())
             .replace("{latent_risk}", str(h.get("latent_risk", "")).strip())
             .replace("{mitigation}",  str(h.get("mitigation", "")).strip()))
+
+
+def build_rag_prompt_v2(hits, base_prompt):
+    """Fill RAG_CAPTION_PROMPT_V2 with all top-k hits as compact bullets.
+
+    Format: '- <trigger>: <latent_risk> -> <mitigation>'
+    Falls back to the plain base prompt when nothing is retrieved.
+    """
+    if not hits:
+        return base_prompt
+    lines = "\n".join(
+        f"- {h.get('trigger', '').strip()}: "
+        f"{h.get('latent_risk', '').strip()} -> "
+        f"{h.get('mitigation', '').strip()}"
+        for h in hits
+    )
+    return RAG_CAPTION_PROMPT_V2.replace("{policy_list}", lines)
+
+
+RAG_CAPTION_PROMPT_V3 = (
+    "Respond in English only. You are the perception module of a self-driving car.\n"
+    "You have retrieved these safety policies from a database:\n"
+    "{policy_list}\n\n"
+    "Step 1: Look at the image and describe the actual layout (weather, ego vehicle path, surrounding vehicles). "
+    "Are there any vehicles very close by or cutting in? Ignore the policies for now.\n"
+    "Step 2: Compare your observation with the retrieved policies. Do any of them accurately describe the scene? "
+    "If not, explicitly state that they are irrelevant distractors.\n"
+    "Step 3: Write a final driving caption inside <final_caption> and </final_caption> tags. "
+    "It must be ONE sentence, strictly under 40 words, focusing only on the true safety-critical hazard "
+    "and what the ego vehicle is doing about it."
+)
+
+
+def build_rag_prompt_v3(hits, base_prompt):
+    """Fill RAG_CAPTION_PROMPT_V3 with all top-k hits for CoT reasoning."""
+    if not hits:
+        return base_prompt
+    lines = "\n".join(
+        f"- {h.get('trigger', '').strip()}: "
+        f"{h.get('latent_risk', '').strip()} -> "
+        f"{h.get('mitigation', '').strip()}"
+        for h in hits
+    )
+    return RAG_CAPTION_PROMPT_V3.replace("{policy_list}", lines)
+
+
+# ---------------------------------------------------------------------------
+# V5: combines V3's CoT uncertainty reasoning with V4's plain-caption grounding.
+# Feeds the plain caption as a fallible starting point, runs 3-step CoT to
+# correct errors and verify policy relevance, outputs inside <final_caption>.
+# ---------------------------------------------------------------------------
+RAG_CAPTION_PROMPT_V5 = (
+    "Respond in English only.\n"
+    "You are the perception module of a self-driving car.\n\n"
+    "Scene caption (starting point only — may contain errors, correct it):\n"
+    "  {plain_caption}\n\n"
+    "Safety knowledge from visually similar crash scenes:\n"
+    "{policy_list}\n\n"
+    "Step 1: Look at the image. What objects are actually visible? "
+    "Correct any errors in the scene caption — if something is only partially visible or uncertain, say so.\n"
+    "Step 2: Compare what you actually see with the safety policies. "
+    "Does any policy match the real scene? If not, state it is an irrelevant distractor.\n"
+    "Step 3: Write your final caption inside <final_caption> and </final_caption> tags. "
+    "ONE sentence, strictly under 35 words. "
+    "Lead with the true hazard you can confirm is visible. "
+    "End with what the ego vehicle is doing (speed/turn/brake intent). "
+    "Never mention vehicles, pedestrians, or objects not visible in the image."
+)
+
+
+def build_rag_prompt_v5(hits, plain_caption: str, base_prompt: str) -> str:
+    """Fill RAG_CAPTION_PROMPT_V5 with the plain caption + top-k policy bullets."""
+    if not hits:
+        return base_prompt
+    lines = "\n".join(
+        f"- {h.get('trigger', '').strip()}: "
+        f"{h.get('latent_risk', '').strip()} -> "
+        f"{h.get('mitigation', '').strip()}"
+        for h in hits
+    )
+    return (RAG_CAPTION_PROMPT_V5
+            .replace("{plain_caption}", plain_caption.strip())
+            .replace("{policy_list}", lines))
+
+
+# ---------------------------------------------------------------------------
+# V6: structured citation output — forces explicit cross-referencing between
+# the retrieved policy and the visual scene before committing to an action.
+# Output format:
+#   Visible Scene: <what the model actually sees>
+#   Applied Policy: <the specific policy used, or "None">
+#   Action: <final ego action sentence — this is what gets fed to the VLA>
+# ---------------------------------------------------------------------------
+RAG_CAPTION_PROMPT_V6 = (
+    "Respond in English only.\n"
+    "You are the perception module of a self-driving car.\n\n"
+    "Scene caption (starting point only — may contain errors, correct it):\n"
+    "  {plain_caption}\n\n"
+    "Retrieved safety policies:\n"
+    "{policy_list}\n\n"
+    "Respond in exactly this format — three lines, no extra text:\n"
+    "Visible Scene: (one sentence describing only what you actually see in the image, "
+    "correcting any errors in the scene caption)\n"
+    "Applied Policy: (quote the ONE policy entry you are applying, "
+    "or write 'None' if no policy matches what you actually see)\n"
+    "Action: (one sentence, under 35 words — ego vehicle's safety-critical action "
+    "based only on confirmed visible objects)\n\n"
+    "Never mention objects, vehicles, or hazards not visible in the image. "
+    "Never invent colors, directions, or specific measurements."
+)
+
+
+def build_rag_prompt_v6(hits, plain_caption: str, base_prompt: str) -> str:
+    """Fill RAG_CAPTION_PROMPT_V6 with the plain caption + top-k policy bullets."""
+    if not hits:
+        return base_prompt
+    lines = "\n".join(
+        f"- {h.get('trigger', '').strip()}: "
+        f"{h.get('latent_risk', '').strip()} -> "
+        f"{h.get('mitigation', '').strip()}"
+        for h in hits
+    )
+    return (RAG_CAPTION_PROMPT_V6
+            .replace("{plain_caption}", plain_caption.strip())
+            .replace("{policy_list}", lines))
+
+
+def parse_v6_caption(text: str) -> str:
+    """Extract the Action: line from V6 structured output."""
+    m = re.search(r"Action:\s*(.+?)(?:\n|$)", text, flags=re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# V7: single-call version of V6 — no pre-generated plain caption.
+# The model sees only the image + policy list and outputs the structured format
+# in one pass. Visible Scene: is parsed as the plain caption (for no-RAG /
+# Fix3/Fix4), Action: is parsed as the RAG caption.
+# Saves ~50% of VLM inference time vs two-call designs.
+# ---------------------------------------------------------------------------
+RAG_CAPTION_PROMPT_V7 = (
+    "Respond in English only.\n"
+    "You are the perception module of a self-driving car.\n\n"
+    "Retrieved safety policies:\n"
+    "{policy_list}\n\n"
+    "Respond in exactly this format — three lines, no extra text:\n"
+    "Visible Scene: (one sentence — from the ego vehicle's perspective, describe only what you actually see)\n"
+    "Applied Policy: (quote the ONE policy entry you are applying, "
+    "or write 'None' if no policy matches what you see)\n"
+    "Action: (one sentence, under 35 words — ego vehicle's safety-critical action "
+    "based only on confirmed visible objects)\n\n"
+    "IMPORTANT: Every line must be one complete sentence — never cut off mid-sentence. "
+    "Finish the Action line before stopping.\n"
+    "Never mention objects not visible in the image. "
+    "Never invent colors, directions, or specific measurements."
+)
+
+
+def build_rag_prompt_v7(hits, base_prompt: str) -> str:
+    """Fill RAG_CAPTION_PROMPT_V7 with top-k policy bullets.
+
+    Falls back to base_prompt when nothing is retrieved.
+    """
+    if not hits:
+        return base_prompt
+    lines = "\n".join(
+        f"- {h.get('trigger', '').strip()}: "
+        f"{h.get('latent_risk', '').strip()} -> "
+        f"{h.get('mitigation', '').strip()}"
+        for h in hits
+    )
+    return RAG_CAPTION_PROMPT_V7.replace("{policy_list}", lines)
+
+
+def parse_v7_scene(text: str) -> str:
+    """Extract the Visible Scene: line from V7 structured output."""
+    m = re.search(r"Visible Scene:\s*(.+?)(?:\n|$)", text, flags=re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Better base prompt: action-first, ≤35-word output, fits in 77 CLIP tokens.
+# Does NOT touch covla_vla/config.py — override only in this eval script.
+# ---------------------------------------------------------------------------
+BASE_CAPTION_PROMPT = (
+    "You are the perception module of a self-driving car. "
+    "Look at this front-camera frame and write ONE sentence, under 35 words:\n"
+    "1) What the ego vehicle is doing (speed/turn intent).\n"
+    "2) The single most safety-critical object or condition visible.\n"
+    "3) What the ego must do next (brake, yield, maintain speed, etc.).\n"
+    "No lists, no markdown, plain English only."
+)
+
+# ---------------------------------------------------------------------------
+# V4 RAG prompt: "refine" style — passes the plain caption as grounding so
+# the model augments rather than hallucinating from scratch.
+# ---------------------------------------------------------------------------
+RAG_CAPTION_PROMPT_V4 = (
+    "Respond in English only.\n"
+    "You are the perception module of a self-driving car.\n\n"
+    "Scene caption (from a generic pass):\n"
+    "  {plain_caption}\n\n"
+    "Safety knowledge from visually similar crash scenes "
+    "(use only entries that match what you actually see; ignore the rest):\n"
+    "{policy_list}\n\n"
+    "Rewrite the caption in ONE sentence, strictly under 35 words:\n"
+    "1) Keep accurate facts from the scene caption.\n"
+    "2) Only incorporate a policy if its specific hazard is clearly visible in the image — if you cannot see it, omit it entirely.\n"
+    "3) End with what the ego vehicle is doing (speed/turn/brake intent).\n"
+    "Never mention vehicles, pedestrians, or objects not visible in the image, even if the policy describes them.\n"
+    "Plain English only."
+)
+
+
+def build_rag_prompt_v4(hits, plain_caption: str, base_prompt: str) -> str:
+    """Fill RAG_CAPTION_PROMPT_V4 with the plain caption + top-k policy bullets.
+
+    Falls back to base_prompt when nothing is retrieved.
+    """
+    if not hits:
+        return base_prompt
+    lines = "\n".join(
+        f"- {h.get('trigger', '').strip()}: "
+        f"{h.get('latent_risk', '').strip()} -> "
+        f"{h.get('mitigation', '').strip()}"
+        for h in hits
+    )
+    return (RAG_CAPTION_PROMPT_V4
+            .replace("{plain_caption}", plain_caption.strip())
+            .replace("{policy_list}", lines))
+
+
+def parse_v3_caption(text: str) -> str:
+    """Extract the string between <final_caption> and </final_caption>."""
+    m = re.search(r"<final_caption>(.*?)</final_caption>", text, flags=re.DOTALL | re.IGNORECASE)
+    if m:
+        return m.group(1).strip()
+    return text.strip()
 
 
 GTA_PARTITION_NAMES = [
@@ -607,6 +872,8 @@ def main():
     ap.add_argument("--max-pixels",       type=int, default=512 * 512,
                     help="Cap on visual tokens per frame for Qwen captioners")
     ap.add_argument("--num-clips",        type=int,   default=5)
+    ap.add_argument("--target-clip",      default=None,
+                    help="Specific clip ID to evaluate (e.g. GTACrash_accident_part1_clip0033)")
     ap.add_argument("--seed",             type=int,   default=0)
     ap.add_argument("--top-k",            type=int,   default=5)
     ap.add_argument("--fps",              type=int,   default=4)
@@ -625,8 +892,28 @@ def main():
                     help="Max frames read per partition (each has ~52k); 0 = all")
     ap.add_argument("--caption-interval", type=int,   default=1,
                     help="Frames between caption + retrieval refreshes (1 = every frame)")
+    ap.add_argument("--max-new-tokens",    type=int,   default=None,
+                    help="Override max_new_tokens for the VLM captioner "
+                         "(default: captioner config value, 96). "
+                         "v7 structured output needs ~200 to avoid truncation.")
+    ap.add_argument("--flip-caption",      action="store_true",
+                    help="Pass the horizontally-flipped image to the VLM captioner "
+                         "(same as the VLA image). Default: captioner sees the original "
+                         "unflipped image, which matches right-hand-traffic VLM training "
+                         "and produces better-aligned captions for CoVLA's text encoder.")
     ap.add_argument("--include-benign",   action="store_true",
                     help="Also sample nonaccident partitions (default: crash only)")
+    ap.add_argument("--rag-prompt",        default="custom",
+                    choices=["custom", "clip_retrieval", "v2", "v3", "v4", "v5", "v6", "v7"],
+                    help="RAG caption prompt style: "
+                         "'custom' (structured action-first, default), "
+                         "'clip_retrieval' (permissive multi-hit from build_vlm_rag_prompt), "
+                         "'v2' (multi-hit + English mandate + 40-word cap + scene-anchor), "
+                         "'v3' (CoT reasoning + <final_caption> tag), "
+                         "'v4' (refine: feeds plain caption as grounding before injecting policy), "
+                         "'v5' (CoT reasoning grounded by plain caption + <final_caption> tag), "
+                         "'v6' (structured citation: Visible Scene / Applied Policy / Action), "
+                         "'v7' (single-call v6: one VLM pass, Visible Scene parsed as plain caption)")
     args = ap.parse_args()
 
     num_waypoints = args.traj_horizon // args.traj_step
@@ -660,9 +947,12 @@ def main():
     matcher  = build_or_load_policy_index(pol_path, idx_path,
                                           args.clip_model, embedder=clip_emb)
     retr     = GtaSceneRetriever(clip_emb, matcher, args.top_k, args.retr_window)
-    vlm      = VLMCaptioner(device, model_id=captioner_id, max_pixels=args.max_pixels)
-    base_prompt = REALTIME.caption_prompt
-    print(f"policy index   : {len(matcher)} entries\n")
+    vlm      = VLMCaptioner(device, model_id=captioner_id, max_pixels=args.max_pixels,
+                            max_new_tokens=args.max_new_tokens)
+    base_prompt = BASE_CAPTION_PROMPT
+    rag_prompt_style = args.rag_prompt
+    print(f"policy index   : {len(matcher)} entries")
+    print(f"rag prompt     : {rag_prompt_style}\n")
 
     # ---- gather a small pool of clips, stopping early
     partition_names = [n for n in GTA_PARTITION_NAMES
@@ -691,7 +981,14 @@ def main():
     if not all_clips:
         print("no usable clips found - check --gta-root and partition layout.")
         return
-    chosen = rng.sample(all_clips, min(args.num_clips, len(all_clips)))
+    
+    if args.target_clip:
+        chosen = [c for c in all_clips if c[0] == args.target_clip]
+        if not chosen:
+            print(f"target clip {args.target_clip} not found!")
+            return
+    else:
+        chosen = rng.sample(all_clips, min(args.num_clips, len(all_clips)))
     print(f"selected clips     : {len(chosen)}\n")
 
     all_metrics: dict = {}
@@ -702,25 +999,60 @@ def main():
               f"(caption every {args.caption_interval} frame(s) x2)")
 
         # ---- per-frame captions and retrieval hits
-        caps_plain, caps_rag, policy_texts, hits_list = [], [], [], []
+        caps_plain, caps_rag, caps_full_cot, policy_texts, hits_list = [], [], [], [], []
         cur_cap_plain: str | None = None
         cur_cap_rag:   str | None = None
+        cur_cap_full:  str | None = None
         t_cap: list[float] = []
 
         for j, s in enumerate(samples):
             bgr     = cv2.imread(str(s["image_path"]))
             bgr_vla = cv2.flip(bgr, 1)          # flip to match CoVLA training distribution
+            bgr_cap = bgr_vla if args.flip_caption else bgr      # image shown to VLM
             hits    = retr.hits_for(samples, j)
 
             if (j % args.caption_interval == 0) or (cur_cap_plain is None):
                 t0 = time.time()
-                cur_cap_plain = vlm.caption(bgr_vla, base_prompt)
-                cur_cap_rag   = vlm.caption(bgr_vla,
-                                            build_custom_rag_prompt(hits, base_prompt))
+                if rag_prompt_style == "v7":
+                    # Single-call: one VLM pass produces both the scene description
+                    # and the policy-informed action.
+                    rag_p   = build_rag_prompt_v7(hits, base_prompt)
+                    raw_out = vlm.caption(bgr_cap, rag_p)
+                    cur_cap_plain = parse_v7_scene(raw_out)
+                    cur_cap_full  = raw_out
+                    cur_cap_rag   = parse_v6_caption(raw_out)   # reuse Action: parser
+                else:
+                    cur_cap_plain = vlm.caption(bgr_cap, base_prompt)
+                    if rag_prompt_style == "clip_retrieval":
+                        rag_p = build_vlm_rag_prompt(base_prompt, hits)
+                    elif rag_prompt_style == "v2":
+                        rag_p = build_rag_prompt_v2(hits, base_prompt)
+                    elif rag_prompt_style == "v3":
+                        rag_p = build_rag_prompt_v3(hits, base_prompt)
+                    elif rag_prompt_style == "v4":
+                        rag_p = build_rag_prompt_v4(hits, cur_cap_plain, base_prompt)
+                    elif rag_prompt_style == "v5":
+                        rag_p = build_rag_prompt_v5(hits, cur_cap_plain, base_prompt)
+                    elif rag_prompt_style == "v6":
+                        rag_p = build_rag_prompt_v6(hits, cur_cap_plain, base_prompt)
+                    else:
+                        rag_p = build_custom_rag_prompt(hits, base_prompt)
+
+                    raw_out = vlm.caption(bgr_cap, rag_p)
+                    if rag_prompt_style in ("v3", "v5") and hits:
+                        cur_cap_full = raw_out
+                        cur_cap_rag  = parse_v3_caption(raw_out)
+                    elif rag_prompt_style == "v6" and hits:
+                        cur_cap_full = raw_out
+                        cur_cap_rag  = parse_v6_caption(raw_out)
+                    else:
+                        cur_cap_full = raw_out
+                        cur_cap_rag  = raw_out
                 t_cap.append(time.time() - t0)
 
             caps_plain.append(cur_cap_plain)
             caps_rag.append(cur_cap_rag)
+            caps_full_cot.append(cur_cap_full)
             policy_texts.append(hits_to_policy_text(hits))
             hits_list.append(hits)
 
@@ -792,7 +1124,7 @@ def main():
               f"({n_gt} frames w/ GT, {cap_ms:.0f} ms/caption x2)")
 
         # ---- render the video
-        out = OUT_DIR / f"gta_{ci:02d}_{clip_id}_{pol_label}_{cap_tag}.mp4"
+        out = OUT_DIR / f"gta_{ci:02d}_{clip_id}_{pol_label}_{cap_tag}_{rag_prompt_style}.mp4"
         render_clip_video(samples, trajs, caps_plain, caps_rag,
                           policy_texts, hits_list, pol_label, cap_tag, out,
                           fps=args.fps)
@@ -804,6 +1136,7 @@ def main():
             "has_gt":                s["gt_traj"] is not None,
             "caption_no_rag":        caps_plain[k],
             "caption_policy_prompt": caps_rag[k],
+            "caption_full_cot":      caps_full_cot[k],
             "policy_text":           policy_texts[k],
             "retrieved": [{"clip_id": h["clip_id"], "score": h["score"]}
                           for h in hits_list[k]],
@@ -821,7 +1154,7 @@ def main():
                                     if s["gt_traj"] is not None else None),
         } for k, s in enumerate(samples)]
 
-    metrics_path = OUT_DIR / f"metrics_gta_with_rag_{pol_label}_{cap_tag}.json"
+    metrics_path = OUT_DIR / f"metrics_gta_with_rag_{pol_label}_{cap_tag}_{rag_prompt_style}.json"
     with open(metrics_path, "w", encoding="utf-8") as f:
         json.dump(all_metrics, f, indent=2, ensure_ascii=False)
 
